@@ -37,18 +37,18 @@ def is_refusal_output(text: str) -> bool:
     return bool(text) and any(p in text for p in _REFUSAL_PHRASES)
 
 
-def retrieval_metrics(rank_lists: dict, meta: dict = None) -> dict:
+def retrieval_metrics(rank_lists: dict, meta: dict = None, k: int = 10) -> dict:
     """检索层指标
 
     Args:
         rank_lists: {qid: {"ranked": [chunk_id...], "gold": [chunk_id...]}}
         meta: 可选，{qid: {"layer": str, "domain": str}}，提供时输出分层/分领域 Recall
+        k: 截断深度（默认10，检索诊断时可传8与生产top-k对齐）
 
     Returns:
         {"recall@10": float, "mrr@10": float, "hit_detail": {qid: rank},
          "layers": {layer: {...}}, "domains": {domain: {...}}}
     """
-    k = 10
     recall_sum, mrr_sum = 0.0, 0.0
     n = 0
     hit_detail = {}
@@ -84,8 +84,8 @@ def retrieval_metrics(rank_lists: dict, meta: dict = None) -> dict:
                        "n": s["n"], "hit": s["hit"]}
                 for name, s in stats.items()}
     return {
-        "recall@10": recall_sum / n if n else 0.0,
-        "mrr@10": mrr_sum / n if n else 0.0,
+        f"recall@{k}": recall_sum / n if n else 0.0,
+        f"mrr@{k}": mrr_sum / n if n else 0.0,
         "hit_detail": hit_detail,
         "layers": _agg(layer_stats),
         "domains": _agg(domain_stats),

@@ -28,12 +28,14 @@ from eval.metrics import (retrieval_metrics, answer_accuracy, format_report,
 
 EVAL_SET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_set_v1.jsonl")
 REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-VALID_OPTIONS = ["A", "B", "C", "D"]
+# 五选项兼容：v2 综合评测集多选题为 5 选项（A-E），zip 短列表自动截断不影响 4 选项题
+VALID_OPTIONS = ["A", "B", "C", "D", "E"]
 
 
-def load_eval_set(max_items: int = None) -> list:
+def load_eval_set(max_items: int = None, eval_set_path: str = None) -> list:
     items = []
-    with open(EVAL_SET_PATH, encoding="utf-8") as f:
+    path = eval_set_path or EVAL_SET_PATH
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 items.append(json.loads(line))
@@ -139,12 +141,22 @@ def run_full_system(items: list, domain_systems: dict) -> dict:
     for i, q in enumerate(items):
         try:
             system = domain_systems[q["domain"]]
+            # 格式归一化：logical/calc 与 mcq 同为 4 选 1 结构，Agent 侧统一按 mcq 处理
+            fmt = q["answer_format"]
+            if fmt in ("logical", "calc"):
+                fmt = "mcq"
+            # 计算题提示：答题时注入运算警示（检索仍用原题干，避免提示词污染 BM25）
+            aq_question = q["question"]
+            if q["answer_format"] == "calc":
+                aq_question += "\n（注意：正确答案是对相关数值进行运算后的结果，与原文单个数值相同的选项通常是干扰项，请先从证据中找到参与运算的数值再计算）"
             evs = system.search(q["question"], _opts_dict(q),
                                 doc_ids=q.get("gold_doc_ids"), top_k=15)
             result = retrievers[q["domain"]].answer_question(
-                question=q["question"], options=_opts_dict(q),
-                answer_format=q["answer_format"], initial_evidence=evs,
+                question=aq_question, options=_opts_dict(q),
+                answer_format=fmt, initial_evidence=evs,
                 domain=q["domain"], doc_ids=q.get("gold_doc_ids"))
+            # 检索相关性：金标 chunk 是否进入初始证据池（top-15）
+            retrieved = {e.get("chunk_id") for e in evs}
             answers[q["qid"]] = {
                 "answer": result.get("answer", ""),
                 "refused": result.get("refused", False),
@@ -153,6 +165,7 @@ def run_full_system(items: list, domain_systems: dict) -> dict:
                 "citations": result.get("citations"),
                 # 答案来源（model/refused_guess/validate_guess 等，诊断用）
                 "answer_source": result.get("answer_source", ""),
+                "retrieval_hit": bool(set(q.get("gold_chunk_ids") or []) & retrieved),
             }
         except Exception as e:
             print(f"  [错误] {q['qid']}: {str(e)[:80]}")
@@ -206,13 +219,20 @@ def main():
                         help="输出文件标签（如 cit），避免小样本评测覆盖正式报告")
     parser.add_argument("--layer", default=None,
                         help="只评测指定层（如 unanswerable），配合 --tag 使用")
+    parser.add_argument("--eval-set", default=None,
+                        help="自定义评测集路径（如 eval_set_v2_100.jsonl）")
+    parser.add_argument("--fmt", default=None,
+                        help="只评测指定题型（逗号分隔，如 multi,calc）")
     args = parser.parse_args()
 
-    items = load_eval_set(args.max)
+    items = load_eval_set(args.max, args.eval_set)
     if args.layer:
         items = [q for q in items if q.get("layer") == args.layer]
+    if args.fmt:
+        items = [q for q in items if q.get("answer_format") in args.fmt.split(",")]
     print(f"评测集: {len(items)} 题，模式: {args.mode}"
-          + (f"，层: {args.layer}" if args.layer else ""))
+          + (f"，层: {args.layer}" if args.layer else "")
+          + (f"，题型: {args.fmt}" if args.fmt else ""))
 
     # 重试模式：加载上次结果，筛出失败题（API 断连导致 tok=0 的 fallback 答案）
     prev_answers = None

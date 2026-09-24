@@ -24,7 +24,9 @@ from typing import Optional
 
 from config import DASHSCOPE_API_KEY, QWEN_MODEL, QWEN_BASE_URL, QWEN_EXTRA_BODY, \
     MAX_ROUNDS_BY_FORMAT, PER_QUESTION_TOKEN_LIMIT, TOOL_CALL_FAILURE_LIMIT, \
-    CITATION_MODE, REFUSAL_MODE, USE_RESPONSES_API, ZERO_EVIDENCE_REFUSAL
+    CITATION_MODE, REFUSAL_MODE, USE_RESPONSES_API, ZERO_EVIDENCE_REFUSAL, \
+    TRAP_DETECTION_ENABLED, TRAP_REFUSAL_POLICY, TRAP_MAX_ROUNDS, \
+    TRAP_TOKEN_EARLY_STOP, TRAP_HINT_KEYWORDS, MULTI_ANCHOR_VERIFY
 from citation_manager import (parse_citations, verify_citations, detect_refusal,
                               check_numeric_support)
 from llm_api import call_llm
@@ -80,6 +82,18 @@ def _extract_opt_anchors(opt_text: str):
     weak += re.findall(r'[一-鿿]{3,}', opt_text)
     weak = list(dict.fromkeys(weak))
     return strong, weak
+
+
+def detect_trap_hint(question: str) -> bool:
+    """检测问题是否自带拒答提示（陷阱题：gold=REFUSED 类）
+
+    陷阱题文本会明确提示"若文档未提及，请拒答"，正常题没有该提示。
+    据此在入口处分流：陷阱题坚决拒答、降轮数省token；正常题永不拒答。
+    （已验证"若文档未提及"对45道陷阱题全覆盖、正常题0误命中）
+    """
+    if not TRAP_DETECTION_ENABLED:
+        return False
+    return any(kw in question for kw in TRAP_HINT_KEYWORDS)
 
 
 def _context_match(text: str, context: str) -> bool:
@@ -925,6 +939,86 @@ class ModelDrivenRetriever:
         # 最后兜底：AB（比赛要求必须至少2个）
         return "AB"
 
+    # ========== 多选锚点验证后处理（MULTI_ANCHOR_VERIFY） ==========
+
+    @staticmethod
+    def _norm_num_for_match(s: str) -> str:
+        """数值匹配归一化：去千分位逗号与空白，便于 '1,425,051' vs '1425051' 匹配"""
+        return s.replace(",", "").replace("，", "").strip()
+
+    def _verify_multi_answer(self, answer: str, options: dict, doc_ids: list,
+                             answer_source: str) -> tuple:
+        """多选锚点验证：逐选项检查"数值锚点+指标词"是否在该题文档 chunk 中共现
+
+        判定逻辑（与零锚点拒答同思路，方向相反）：
+        - 真表述：选项数值（原文值）必然出现在文档某个 chunk，且该 chunk 含指标词（宽松回退：数值全文命中）
+        - 篡改/无据表述：数值不在文档 → 剔除
+        - 验证出的支持选项 ≥2 时以验证结果为准（修复模型"只选1个"漏选）；
+          支持选项 <2 时保留模型答案（防单位换算等锚点匹配失败导致误杀）
+
+        Returns:
+            (final_answer, final_answer_source)
+        """
+        chunk_data = getattr(self.retrieval_system, "chunk_data", {}) or {}
+        doc_chunks = [c for c in chunk_data.values()
+                      if c.get("doc_id") in (doc_ids or []) and c.get("text")]
+        if not doc_chunks:
+            return answer, answer_source
+        # 预归一化 chunk 文本（去逗号），加速数值子串匹配
+        norm_texts = [(c, self._norm_num_for_match(c["text"])) for c in doc_chunks]
+
+        supported = []
+        detail = {}
+        for opt, opt_text in options.items():
+            opt_norm = opt_text.replace("％", "%")
+            # 长锚点（千分位/小数/4位以上数字）：数值命中即可（弱验证）
+            long_nums = re.findall(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{4,}", opt_norm)
+            # 短数字（1-3位）须带单位：单数字太易误配，强验证要求"数字+单位"在 chunk 中完整出现
+            # 左边界 (?<![\d.]) 防止从 "108.98亿元" 中抠出 "98亿"（小数位误配）
+            short_pairs = re.findall(
+                r"(?<![\d.])(\d{1,3})\s*(个月|年|月|日|%|亿|万|元|倍|家|人|次|股|吨|辆|天)", opt_norm)
+            # 裸短数字（无单位，如"等待期为12"/"出货量为550"）：仅强验证（数字+指标词同 chunk）
+            bare_nums = [n for n in re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", opt_norm)
+                         if not re.search(rf"{re.escape(n)}\s*(?:个月|年|月|日|%|亿|万|元|倍|家|人|次|股|吨|辆|天)", opt_norm)]
+            if not long_nums and not short_pairs and not bare_nums:
+                detail[opt] = "no_anchor"
+                continue
+            norm_long = [self._norm_num_for_match(n) for n in long_nums]
+            # 指标词：选项中文实义词（要求与数值同 chunk 共现）
+            terms = [t for t in re.findall(r"[一-鿿]{2,}", opt_norm)
+                     if t not in ("为", "约", "较", "及", "与")]
+            hit = False
+            for c, nt in norm_texts:
+                # 弱验证：长锚点数值命中该 chunk（带数字边界断言，防 "24" 误配 "243"）
+                if long_nums and any(
+                        re.search(rf"(?<!\d){re.escape(n)}(?!\d)", nt)
+                        for n in norm_long):
+                    hit = True
+                    break
+                # 强验证："数字+单位"完整串与指标词同 chunk 共现
+                # （如"等待期12个月"须同 chunk 出现"12个月"与"等待期"）
+                c_norm = c["text"].replace("％", "%")
+                if short_pairs and any(t in c_norm for t in terms) \
+                        and any(re.search(rf"(?<!\d){re.escape(num)}\s*{re.escape(unit)}", c_norm)
+                                for num, unit in short_pairs):
+                    hit = True
+                    break
+                # 裸短数字强验证：数字（带边界）与指标词同 chunk 共现
+                if bare_nums and any(t in c_norm for t in terms) \
+                        and any(re.search(rf"(?<!\d){re.escape(n)}(?!\d)", nt) for n in bare_nums):
+                    hit = True
+                    break
+            detail[opt] = "hit" if hit else "miss"
+            if hit:
+                supported.append(opt)
+
+        # 支持选项 ≥2 → 以验证结果为准；否则保留模型答案（锚点匹配失败防误杀）
+        if len(supported) >= 2:
+            verified = "".join(sorted(supported))
+            src = "anchor_verified" if verified != answer else answer_source
+            return verified, src
+        return answer, answer_source
+
     # ========== 联网搜索支持（Tavily MCP） ==========
 
     def _web_search_tavily(self, query: str, search_depth: str = "basic") -> list:
@@ -1023,6 +1117,19 @@ class ModelDrivenRetriever:
                                 use_responses_api=USE_RESPONSES_API)
             except Exception as e:
                 last_err = e
+                # 部分端点不支持 tool_choice="required"（如 AMD Responses API）：
+                # 降级为 auto 立即重试一次，保住多选"每选项搜证据"的主流程
+                if tool_choice == "required" and "required mode" in str(e):
+                    try:
+                        trace.append({"step": "tool_choice_downgrade",
+                                      "detail": "required不支持，降级auto"})
+                        return call_llm(self.client, self.model, messages,
+                                        tools=tools, tool_choice="auto",
+                                        temperature=0.1, max_tokens=max_tokens,
+                                        extra_body=QWEN_EXTRA_BODY,
+                                        use_responses_api=USE_RESPONSES_API)
+                    except Exception as e2:
+                        last_err = e2
                 if attempt < retries:
                     trace.append({"step": "retry", "attempt": attempt + 1, "detail": str(e)})
                     time.sleep(1)
@@ -1040,6 +1147,7 @@ class ModelDrivenRetriever:
         max_rounds: int = 3,
         doc_ids: list = None,
         trace: list = None,
+        is_trap: bool = False,
     ) -> dict:
         """检索 + 推理 + 工具调用的公共交互流程（不做答案后处理/强制补全）
 
@@ -1048,6 +1156,7 @@ class ModelDrivenRetriever:
 
         Args:
             trace: 如果传入列表，会把每一步（初始证据/每轮工具调用/模型输出）追加进去，供调试打印
+            is_trap: 陷阱题（问题自带拒答提示）→ 追加拒答覆盖指令 + token 早停
 
         Returns:
             {"final_content", "tool_calls_log", "total_tokens",
@@ -1118,6 +1227,16 @@ class ModelDrivenRetriever:
 
 请分析问题，如果初始证据足够就直接回答；如果不够，调用工具搜索补充证据。{multi_hint}"""
 
+        # 陷阱题覆盖指令：追加在 user_message 末尾（后置指令优先级高，压制系统提示中
+        # "文档中未提及也要给出最接近选项"的规则——该规则只适用于正常题，与陷阱题直接冲突）
+        if is_trap:
+            user_message += """
+
+## 本题特殊规则（最高优先级）
+本题为"未提及须拒答"类问题。逐项核对选项后，若所有选项在证据和搜索结果中均找不到直接依据，
+最后一行必须直接写：答案：REFUSED
+（禁止猜测最接近的选项，禁止输出"文档中未提及但仍选择X"）"""
+
         # 对话循环（注入领域知识）
         domain_knowledge = DOMAIN_KNOWLEDGE.get(domain, "")
         system_prompt = TOOL_SYSTEM_PROMPT
@@ -1142,6 +1261,13 @@ class ModelDrivenRetriever:
             if total_tokens > PER_QUESTION_TOKEN_LIMIT:
                 trace.append({"step": "budget_break", "round": round_idx + 1,
                               "detail": f"token={total_tokens} 超过每题阈值 {PER_QUESTION_TOKEN_LIMIT}"})
+                break
+            # 陷阱题 token 早停：陷阱题搜不出证据，提前止损交给收尾消息输出拒答判定
+            if is_trap and TRAP_TOKEN_EARLY_STOP > 0 \
+                    and total_tokens > PER_QUESTION_TOKEN_LIMIT * TRAP_TOKEN_EARLY_STOP:
+                trace.append({"step": "trap_early_stop", "round": round_idx + 1,
+                              "detail": f"token={total_tokens} 超过早停阈值 "
+                                        f"{PER_QUESTION_TOKEN_LIMIT * TRAP_TOKEN_EARLY_STOP:.0f}"})
                 break
             # 多选题首轮强制调用工具（确保为每个选项搜索证据，避免只看初始证据就单选），
             # 后续轮 auto（允许模型收集足够证据后直接回答）
@@ -1234,8 +1360,9 @@ class ModelDrivenRetriever:
                 break
 
         # ========== 文档搜索3轮后，启用联网搜索 ==========
+        # 陷阱题跳过联网搜索：外部资料反而会诱导模型猜测，与拒答目标相悖
         web_search_results = []
-        if self._should_enable_web_search(tool_calls_log, initial_evidence, answer_format, domain):
+        if not is_trap and self._should_enable_web_search(tool_calls_log, initial_evidence, answer_format, domain):
             print(f"  [联网] 文档搜索{len(tool_calls_log)}轮无果，启用联网搜索...")
             try:
                 search_query = question
@@ -1276,11 +1403,22 @@ class ModelDrivenRetriever:
                 print(f"  [联网] 搜索失败: {e}")
 
         # 循环耗尽/熔断/工具降级后仍未产出最终答案时，强制再请求一次（禁止工具调用）
-        if not final_content and tool_calls_log:
+        # 触发条件：final_content 为空，或其中解析不出答案字母（token熔断时常见"中间分析无答案"文本）；
+        # 已含 REFUSED 拒答结论的内容视为已有答案，不再触发（避免重复收尾浪费 token）
+        if tool_calls_log and (not final_content
+                               or ("REFUSED" not in final_content
+                                   and not self._extract_answer(final_content, answer_format))):
+            # 陷阱题收尾消息：明确允许/要求拒答，避免模型被系统提示逼着猜最接近选项
+            if is_trap:
+                force_content = ("已经收集了足够证据。请不再调用工具，直接基于已有证据判断："
+                                 "若文档未提及该信息，最后一行必须写：答案：REFUSED；"
+                                 "只有找到明确依据时才输出对应选项。")
+            else:
+                force_content = ("已经收集了足够证据。请不再调用工具，直接基于已有证据给出最终答案。"
+                                 "先用1-3句话分析关键证据（引用证据编号），最后一行必须写：答案：X")
             force_msg = {
                 "role": "user",
-                "content": "已经收集了足够证据。请不再调用工具，直接基于已有证据给出最终答案。"
-                           "先用1-3句话分析关键证据（引用证据编号），最后一行必须写：答案：X",
+                "content": force_content,
             }
             response = self._chat_with_retry(messages + [force_msg], None, "auto", 800, trace)
             if response and response.choices:
@@ -1324,9 +1462,15 @@ class ModelDrivenRetriever:
             {"answer", "reasoning", "tool_calls_log", "total_tokens",
              "citations", "refused", ...}
         """
+        # 陷阱题分流：问题自带"若文档未提及，请拒答"提示 → 降低工具轮数（搜多了也答不出，省token），
+        # 后处理阶段对答不出/有拒答信号的陷阱题强制输出 REFUSED
+        is_trap = detect_trap_hint(question)
         # 按题型分级的轮数预算（多选题搜索面大给更多轮，判断题收敛快给更少轮）
         if max_rounds is None:
-            max_rounds = MAX_ROUNDS_BY_FORMAT.get(answer_format, 3)
+            if is_trap and TRAP_MAX_ROUNDS > 0:
+                max_rounds = TRAP_MAX_ROUNDS
+            else:
+                max_rounds = MAX_ROUNDS_BY_FORMAT.get(answer_format, 3)
 
         if not self.client:
             fallback_answer = self._evidence_based_fallback(
@@ -1341,7 +1485,7 @@ class ModelDrivenRetriever:
         loop_result = self._run_tool_loop(
             question, options, answer_format,
             initial_evidence=initial_evidence, domain=domain,
-            max_rounds=max_rounds, doc_ids=doc_ids,
+            max_rounds=max_rounds, doc_ids=doc_ids, is_trap=is_trap,
         )
         final_content = loop_result["final_content"]
         tool_calls_log = loop_result["tool_calls_log"]
@@ -1399,16 +1543,32 @@ class ModelDrivenRetriever:
 
         # 统一答案校验（只做格式规范，不做内容补全）
         if not answer:
-            # 模型完全没有输出答案
-            if answer_format == "tf":
-                answer = "A"  # 判断题兜底
-                answer_source = "validate_guess"
-            elif answer_format == "mcq":
-                answer = "A"  # 单选兜底
-                answer_source = "validate_guess"
-            elif answer_format == "multi":
-                answer = "A"  # 多选题兜底：至少选一个
-                answer_source = "validate_guess"
+            # 兜底前先尝试"数值→选项字母"映射：计算题模型常直接输出计算结果数值（如"答案：26"）
+            # 而非选项字母，此时从最终回答中匹配选项的数值文本反推字母。
+            # 取"数值最后出现位置最靠后"的选项——原始值（运算数）先出现，计算结果在最后
+            if answer_format == "mcq" and options and final_content:
+                content_norm = final_content.replace(",", "")
+                best_letter, best_pos = None, -1
+                for letter, opt_text in options.items():
+                    nums = re.findall(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+", opt_text)
+                    if not nums:
+                        continue
+                    pos = [content_norm.rfind(n.replace(",", "")) for n in nums]
+                    if all(p >= 0 for p in pos) and max(pos) > best_pos:
+                        best_letter, best_pos = letter, max(pos)
+                if best_letter:
+                    answer, answer_source = best_letter, "model_value_matched"
+            if not answer:
+                # 模型完全没有输出答案
+                if answer_format == "tf":
+                    answer = "A"  # 判断题兜底
+                    answer_source = "validate_guess"
+                elif answer_format == "mcq":
+                    answer = "A"  # 单选兜底
+                    answer_source = "validate_guess"
+                elif answer_format == "multi":
+                    answer = "A"  # 多选题兜底：至少选一个
+                    answer_source = "validate_guess"
         else:
             # 格式规范化：去重排序，只保留有效字母
             valid = set(options.keys()) if options else {"A", "B", "C", "D"}
@@ -1418,11 +1578,18 @@ class ModelDrivenRetriever:
                 if answer_format in ("mcq", "tf"):
                     answer = "A"
 
+        # 多选锚点验证后处理（MULTI_ANCHOR_VERIFY）：修复模型"只选1个"漏选/凑数
+        # 逐选项验证数值锚点在文档 chunk 的共现，支持≥2 项时以验证结果为准
+        if MULTI_ANCHOR_VERIFY and answer_format == "multi" and doc_ids:
+            answer, answer_source = self._verify_multi_answer(
+                answer, options, doc_ids, answer_source)
+
         # 零锚点强制拒答（ZERO_EVIDENCE_REFUSAL，金融场景可信优先）：
         # 单选/判断题中，模型选中选项的强锚点（数值/年份/条款号/法规名）全部不在证据池原文，
         # 且模型未引用任何有效证据 → 选项无文档依据，强制拒答而非硬猜（陷阱题主要失分点）。
         # 注意：必须放在格式规范化之后，避免 "REFUSED" 中的 E/D 被过滤成 "D"
-        if (ZERO_EVIDENCE_REFUSAL and not refused_signal
+        # 仅对陷阱题启用：正常题零锚点误拒代价 > 猜对收益（single_hop 实测 1 题误拒 0 题挽救）
+        if (ZERO_EVIDENCE_REFUSAL and is_trap and not refused_signal
                 and answer_format in ("mcq", "tf") and answer in options):
             sel_text = options.get(answer, "")
             strong_anchors, _ = _extract_opt_anchors(sel_text)
@@ -1432,6 +1599,23 @@ class ModelDrivenRetriever:
                 refused_signal = True
                 answer_source = "zero_evidence_refused"
                 answer = "REFUSED"
+
+        # 陷阱题强制拒答（TRAP_REFUSAL_POLICY=auto_refuse）：问题自带"若文档未提及请拒答"提示
+        # 且模型给出拒答信号 / 没输出可解析答案（validate_guess/refused_guess/no_answer）时，
+        # 统一收敛为 REFUSED。必须放在零锚点分支之后、格式规范化之后（同上 REFUSED 被过滤的坑）。
+        # model 来源且可能持有有效证据的答案不覆盖，保留模型判断（如"提示拒答但实际有答案"的题）。
+        if (is_trap and TRAP_REFUSAL_POLICY == "auto_refuse"
+                and answer_format in ("mcq", "tf")
+                and (refused_signal
+                     or answer_source in ("validate_guess", "refused_guess", "no_answer"))):
+            answer = "REFUSED"
+            answer_source = "trap_refused"
+            refused_signal = True
+
+        # 正常题永不拒答（guess_fallback 模式）：拒答信号时已保留最佳猜测字母，
+        # 清除 refused 标志，避免评测把"猜对了的拒答题"计为误拒（single_hop 实测 8 题转正）
+        if not is_trap and REFUSAL_MODE != "strict":
+            refused_signal = False
 
         # 收集证据出处
         evidence_sources = []
@@ -1765,6 +1949,12 @@ class ModelDrivenRetriever:
                 answer_source = "validate_guess"
                 if answer_format in ("mcq", "tf"):
                     answer = "A"
+
+        # 多选锚点验证后处理（MULTI_ANCHOR_VERIFY）：修复模型"只选1个"漏选/凑数
+        # 逐选项验证数值锚点在文档 chunk 的共现，支持≥2 项时以验证结果为准
+        if MULTI_ANCHOR_VERIFY and answer_format == "multi" and doc_ids:
+            answer, answer_source = self._verify_multi_answer(
+                answer, options, doc_ids, answer_source)
 
         # 多选题强制至少2个选项
         if answer_format == "multi" and len(answer) == 1:

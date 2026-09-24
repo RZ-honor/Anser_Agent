@@ -121,6 +121,18 @@ REFUSAL_MODE = os.environ.get("REFUSAL_MODE", "guess_fallback")    # guess_fallb
 # 零锚点强制拒答：模型选中的选项其强锚点（数值/年份/条款号）均不在证据池原文中，
 # 且模型无有效引用时，判定为"选项无文档依据"，强制拒答而非猜测（金融场景可信优先）
 ZERO_EVIDENCE_REFUSAL = os.environ.get("ZERO_EVIDENCE_REFUSAL", "1") == "1"
+# 多选锚点验证后处理：逐选项检查"数值锚点+指标词"是否在该题文档 chunk 中共现，
+# 真表述（原文数值）必命中、篡改/无据表述必不命中；验证支持选项≥2 时以验证结果为准
+MULTI_ANCHOR_VERIFY = os.environ.get("MULTI_ANCHOR_VERIFY", "1") == "1"
+
+# ============ 陷阱题分流（题目自带"若文档未提及，请拒答"提示）============
+# 核心策略：陷阱题坚决拒答，正常题永不拒答（拒答提示词只在陷阱题文本中出现）
+TRAP_DETECTION_ENABLED = os.environ.get("TRAP_DETECTION_ENABLED", "1") == "1"  # 总开关，0=完全回退旧行为
+TRAP_REFUSAL_POLICY = os.environ.get("TRAP_REFUSAL_POLICY", "auto_refuse")     # auto_refuse=拒答信号或答不出时输出REFUSED / legacy=旧行为
+TRAP_MAX_ROUNDS = int(os.environ.get("TRAP_MAX_ROUNDS", "2"))                  # 陷阱题工具轮数上限（省token，陷阱题搜多了也答不出）
+TRAP_TOKEN_EARLY_STOP = float(os.environ.get("TRAP_TOKEN_EARLY_STOP", "0.5"))  # 陷阱题token早停比例（×PER_QUESTION_TOKEN_LIMIT，0=禁用）
+# 拒答提示词表：已验证"若文档未提及"对45陷阱题全覆盖、正常题0误命中；正式赛题措辞不同时可在此扩展
+TRAP_HINT_KEYWORDS = ["若文档未提及", "请拒答", "未提及请", "若未提及"]
 
 # ============ 答案配置 ============
 ANSWER_FORMATS = {
